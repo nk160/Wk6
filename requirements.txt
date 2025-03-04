@@ -1,0 +1,13 @@
+numpy<2.0.0
+torch>=2.0.0
+torchvision>=0.15.0
+diffusers>=0.21.0
+transformers>=4.30.0
+accelerate>=0.21.0
+wandb>=0.15.0
+pillow>=10.0.0
+tqdm>=4.65.0
+scipy>=1.10.0
+safetensors>=0.3.1
+bitsandbytes>=0.41.1  # For 8-bit optimization when using GPU
+# Removed xformers as it's not compatible with MacOS 
