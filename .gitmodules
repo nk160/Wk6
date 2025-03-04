@@ -1,0 +1,3 @@
+[submodule "wikiart"]
+	path = wikiart
+	url = https://github.com/lucasdavid/wikiart.git

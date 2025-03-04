@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 import random
+from peft import LoraConfig, get_peft_model
+import torch.nn as nn
 
 # Project configuration
 class Config:
@@ -97,29 +99,42 @@ def collect_artwork(artists: List[str] = ["Claude Monet", "Vincent van Gogh"]) -
     
     for artist in artists:
         print(f"\nFetching artwork for {artist}...")
-        result = subprocess.run([
+        
+        # Run with output streaming
+        process = subprocess.Popen([
             "python3", 
             str(wikiart_dir / "wikiart.py"),
             "--datadir", str(artwork_dir),
             "fetch",
             "--only", artist
-        ], capture_output=True, text=True)
+        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
         
-        if result.returncode != 0:
-            print(f"Error fetching {artist}'s artwork:")
-            print(result.stderr)
-            continue
+        # Stream both stdout and stderr in real-time
+        while True:
+            output = process.stdout.readline()
+            error = process.stderr.readline()
             
-        # Move files to appropriate directories
-        artist_dir = artwork_dir / artist.replace(" ", "_")
+            if output == '' and error == '' and process.poll() is not None:
+                break
+            if output:
+                print(output.strip())
+            if error:
+                print(f"Error: {error.strip()}", file=sys.stderr)
+        
+        # Move files from the images directory to appropriate directories
+        images_dir = artwork_dir / "images"
         if artist == "Claude Monet":
-            for img in artist_dir.glob("*.jpg"):
-                img.rename(Config.MONET_DIR / img.name)
-                monet_count += 1
+            for img in images_dir.glob("*.jpg"):
+                if "claude_monet" in img.name.lower():
+                    img.rename(Config.MONET_DIR / img.name)
+                    monet_count += 1
+            print(f"Moved {monet_count} Monet paintings to {Config.MONET_DIR}")
         elif artist == "Vincent van Gogh":
-            for img in artist_dir.glob("*.jpg"):
-                img.rename(Config.VANGOGH_DIR / img.name)
-                vangogh_count += 1
+            for img in images_dir.glob("*.jpg"):
+                if "vincent_van_gogh" in img.name.lower():
+                    img.rename(Config.VANGOGH_DIR / img.name)
+                    vangogh_count += 1
+            print(f"Moved {vangogh_count} Van Gogh paintings to {Config.VANGOGH_DIR}")
                 
     return monet_count, vangogh_count
 
@@ -150,8 +165,17 @@ def setup_model(config: TrainingConfig, device: str):
     if device == "cuda":
         pipeline.enable_model_cpu_offload()
     
-    # Enable LoRA training
-    pipeline.enable_lora_training()
+    # Setup LoRA configuration
+    lora_config = LoraConfig(
+        r=config.lora_r,
+        lora_alpha=config.lora_alpha,
+        target_modules=["to_q", "to_k", "to_v", "to_out.0"],
+        lora_dropout=config.lora_dropout,
+        bias="none",
+    )
+    
+    # Apply LoRA to the UNet
+    pipeline.unet = get_peft_model(pipeline.unet, lora_config)
     
     return pipeline, accelerator
 
@@ -325,6 +349,11 @@ def main():
     # Initialize training config
     training_config = TrainingConfig()
     
+    # Force data collection first
+    print("\nStarting artwork collection...")
+    monet_count, vangogh_count = collect_artwork()
+    print(f"\nCollected {monet_count} Monet paintings and {vangogh_count} Van Gogh paintings")
+    
     # Setup model and accelerator
     pipeline, accelerator = setup_model(training_config, device)
     print(f"Model loaded and configured for {device}")
@@ -333,33 +362,24 @@ def main():
         print("GPU Memory allocated:", torch.cuda.memory_allocated() / 1e9, "GB")
         print("GPU Memory cached:", torch.cuda.memory_reserved() / 1e9, "GB")
     
-    # Data collection can run in background
-    if Config.MONET_DIR.exists() and Config.VANGOGH_DIR.exists():
-        print("\nUsing existing artwork...")
-        monet_count = len(list(Config.MONET_DIR.glob("*.jpg")))
-        vangogh_count = len(list(Config.VANGOGH_DIR.glob("*.jpg")))
-        print(f"Found {monet_count} Monet paintings and {vangogh_count} Van Gogh paintings")
+    # Check if we have data
+    if monet_count > 0 and vangogh_count > 0:
+        print("\nStarting training loop...")
+        pipeline = train_loop(training_config, pipeline, accelerator, device)
+        print("\nTraining completed!")
         
-        # Start training if we have data
-        if monet_count > 0 and vangogh_count > 0:
-            print("\nStarting training loop...")
-            pipeline = train_loop(training_config, pipeline, accelerator, device)
-            print("\nTraining completed!")
-            
-            # Generate sample images
-            print("\nGenerating sample images...")
-            test_images = list(Config.MONET_DIR.glob("*.jpg"))[:5]  # Use first 5 Monet paintings
-            generated_images = generate_images(
-                pipeline=pipeline,
-                source_images=test_images,
-                device=device
-            )
-            print(f"\nGenerated {len(generated_images)} images in Van Gogh style")
-            print(f"Images saved in: {Config.OUTPUT_DIR}")
-        else:
-            print("\nNo artwork found. Please run data collection first.")
+        # Generate sample images
+        print("\nGenerating sample images...")
+        test_images = list(Config.MONET_DIR.glob("*.jpg"))[:5]  # Use first 5 Monet paintings
+        generated_images = generate_images(
+            pipeline=pipeline,
+            source_images=test_images,
+            device=device
+        )
+        print(f"\nGenerated {len(generated_images)} images in Van Gogh style")
+        print(f"Images saved in: {Config.OUTPUT_DIR}")
     else:
-        print("\nArtwork directories not found. Please run data collection first.")
+        print("\nError: No artwork found after collection attempt.")
 
 if __name__ == "__main__":
     main()
