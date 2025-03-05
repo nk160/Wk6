@@ -98,15 +98,11 @@ def train_loop(config: TrainingConfig, pipeline: StableDiffusionPipeline, device
     
     # Basic dataset and dataloader
     dataset = ArtworkDataset(Config.MONET_DIR, config.resolution)
-    dataloader = DataLoader(
-        dataset, 
-        batch_size=1,
-        shuffle=True
-    )
+    dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
     
-    # Get empty text embeddings
+    # Get style prompt embeddings instead of empty
     text_input = pipeline.tokenizer(
-        [""] * 1,
+        ["A painting in the style of Van Gogh"] * 1,  # Style prompt
         return_tensors="pt",
         padding="max_length",
         max_length=pipeline.tokenizer.model_max_length
