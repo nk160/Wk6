@@ -19,6 +19,8 @@ from torchvision import transforms
 import random
 from peft import LoraConfig, get_peft_model
 import torch.nn as nn
+from datetime import datetime
+import time
 
 # Project configuration
 class Config:
@@ -38,25 +40,25 @@ class TrainingConfig:
     """Training configuration"""
     # Model parameters
     pretrained_model_name_or_path: str = "runwayml/stable-diffusion-v1-5"
-    resolution: int = 512  # Standard SD resolution, can reduce to 384 if memory is tight
+    resolution: int = 512
     
     # Training parameters
-    train_batch_size: int = 2  # Reduced from 4 to be safer on GPU memory
-    num_train_epochs: int = 50  # Reduced from 100 for faster initial testing
-    gradient_accumulation_steps: int = 4  # Increased to compensate for smaller batch size
+    train_batch_size: int = 8
+    num_train_epochs: int = 1  # Changed from 10 to 1 for testing
+    gradient_accumulation_steps: int = 1
     
     # Optimizer parameters
     learning_rate: float = 1e-4
-    lr_scheduler: str = "cosine"  # Changed from "constant" for better convergence
-    lr_warmup_steps: int = 100  # Added warmup steps
+    lr_scheduler: str = "cosine"
+    lr_warmup_steps: int = 100
     
     # Performance parameters
     mixed_precision: str = "fp16"
     seed: int = 42
     
     # LoRA specific parameters
-    lora_r: int = 16
-    lora_alpha: int = 32
+    lora_r: int = 32
+    lora_alpha: int = 64
     lora_dropout: float = 0.1
 
 def setup_environment():
@@ -90,53 +92,51 @@ def setup_wikiart_retriever() -> Path:
         ], check=True)
     return wikiart_dir
 
-def collect_artwork(artists: List[str] = ["Claude Monet", "Vincent van Gogh"]) -> Tuple[int, int]:
-    """Collect artwork for specified artists using WikiArt retriever"""
-    wikiart_dir = setup_wikiart_retriever()
-    artwork_dir = Config.DATA_DIR / "wikiart-saved"
+def move_artwork(images_dir: Path, dest_dir: Path, artist_pattern: str) -> int:
+    """Move artwork files with detailed logging"""
+    count = 0
+    print(f"\nSearching for {artist_pattern} in {images_dir}")
     
-    monet_count, vangogh_count = 0, 0
+    # Check multiple possible path patterns
+    possible_paths = [
+        images_dir / artist_pattern.lower().replace(" ", "-"),  # vincent-van-gogh
+        images_dir / "vincent-van-gogh",                       # direct path
+        images_dir                                             # root images dir
+    ]
     
-    for artist in artists:
-        print(f"\nFetching artwork for {artist}...")
-        
-        # Run with output streaming
-        process = subprocess.Popen([
-            "python3", 
-            str(wikiart_dir / "wikiart.py"),
-            "--datadir", str(artwork_dir),
-            "fetch",
-            "--only", artist
-        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
-        
-        # Stream both stdout and stderr in real-time
-        while True:
-            output = process.stdout.readline()
-            error = process.stderr.readline()
-            
-            if output == '' and error == '' and process.poll() is not None:
-                break
-            if output:
-                print(output.strip())
-            if error:
-                print(f"Error: {error.strip()}", file=sys.stderr)
-        
-        # Move files from the images directory to appropriate directories
+    for search_path in possible_paths:
+        print(f"Checking path: {search_path}")
+        if search_path.exists():
+            print(f"Found path: {search_path}")
+            # Look for jpg files recursively
+            for img_file in search_path.rglob("*.jpg"):
+                try:
+                    dest_file = dest_dir / img_file.name
+                    print(f"Moving: {img_file} -> {dest_file}")
+                    img_file.rename(dest_file)
+                    count += 1
+                except Exception as e:
+                    print(f"Error moving {img_file}: {e}")
+    
+    print(f"Found and moved {count} {artist_pattern} paintings")
+    return count
+
+def collect_artwork():
+    """Check for existing artwork or collect if needed"""
+    # Check if we already have Van Gogh paintings
+    vangogh_count = len(list(Config.VANGOGH_DIR.glob("*.jpg")))
+    print(f"\nFound {vangogh_count} existing Van Gogh paintings in {Config.VANGOGH_DIR}")
+    
+    # Only try to move files if we don't have any
+    if vangogh_count == 0:
+        wikiart_dir = setup_wikiart_retriever()
+        artwork_dir = Config.DATA_DIR / "wikiart-saved"
         images_dir = artwork_dir / "images"
-        if artist == "Claude Monet":
-            for img in images_dir.glob("*.jpg"):
-                if "claude_monet" in img.name.lower():
-                    img.rename(Config.MONET_DIR / img.name)
-                    monet_count += 1
-            print(f"Moved {monet_count} Monet paintings to {Config.MONET_DIR}")
-        elif artist == "Vincent van Gogh":
-            for img in images_dir.glob("*.jpg"):
-                if "vincent_van_gogh" in img.name.lower():
-                    img.rename(Config.VANGOGH_DIR / img.name)
-                    vangogh_count += 1
+        if images_dir.exists():
+            vangogh_count = move_artwork(images_dir, Config.VANGOGH_DIR, "vincent_van_gogh")
             print(f"Moved {vangogh_count} Van Gogh paintings to {Config.VANGOGH_DIR}")
-                
-    return monet_count, vangogh_count
+    
+    return vangogh_count
 
 def setup_model(config: TrainingConfig, device: str):
     """Setup the Stable Diffusion model with LoRA configuration"""
@@ -161,10 +161,6 @@ def setup_model(config: TrainingConfig, device: str):
         )
     )
     
-    # Enable memory optimizations for GPU
-    if device == "cuda":
-        pipeline.enable_model_cpu_offload()
-    
     # Setup LoRA configuration
     lora_config = LoraConfig(
         r=config.lora_r,
@@ -177,13 +173,17 @@ def setup_model(config: TrainingConfig, device: str):
     # Apply LoRA to the UNet
     pipeline.unet = get_peft_model(pipeline.unet, lora_config)
     
+    # Keep pipeline on CPU and let accelerator handle device placement
+    pipeline.to("cpu")
+    
     return pipeline, accelerator
 
 class ArtworkDataset(Dataset):
     """Dataset for artwork images"""
-    def __init__(self, source_dir: Path, target_dir: Path, resolution: int = 512):
+    def __init__(self, source_dir: Path, target_dir: Path, resolution: int = 512, device_dtype=torch.float16):
         self.source_images = list(source_dir.glob("*.jpg"))
         self.target_images = list(target_dir.glob("*.jpg"))
+        self.device_dtype = device_dtype
         self.transform = transforms.Compose([
             transforms.Resize((resolution, resolution)),
             transforms.ToTensor(),
@@ -198,95 +198,98 @@ class ArtworkDataset(Dataset):
         target_img = Image.open(random.choice(self.target_images)).convert('RGB')
         
         return {
-            'source_images': self.transform(source_img),
-            'target_images': self.transform(target_img)
+            'source_images': self.transform(source_img).to(self.device_dtype),
+            'target_images': self.transform(target_img).to(self.device_dtype)
         }
 
-def train_loop(
-    config: TrainingConfig,
-    pipeline: StableDiffusionPipeline,
-    accelerator: Accelerator,
-    device: str
-):
+def train_loop(config: TrainingConfig, pipeline: StableDiffusionPipeline, accelerator: Accelerator, device: str):
     """Training loop for LoRA fine-tuning"""
+    print("\nPreparing for training...")
     
-    # Prepare dataset
-    dataset = ArtworkDataset(Config.MONET_DIR, Config.VANGOGH_DIR, config.resolution)
-    dataloader = DataLoader(
-        dataset,
-        batch_size=config.train_batch_size,
-        shuffle=True,
-        num_workers=4
+    # Set UNet to training mode
+    pipeline.unet.train()
+    
+    # Determine dtype
+    dtype = torch.float16 if device == "cuda" else torch.float32
+    
+    # Prepare dataset with correct dtype
+    dataset = ArtworkDataset(Config.MONET_DIR, Config.VANGOGH_DIR, config.resolution, device_dtype=dtype)
+    dataloader = DataLoader(dataset, batch_size=config.train_batch_size, shuffle=True)
+    
+    # Get text embeddings for unconditional generation
+    text_input = pipeline.tokenizer(
+        [""] * config.train_batch_size, 
+        padding="max_length", 
+        max_length=pipeline.tokenizer.model_max_length, 
+        return_tensors="pt"
     )
     
-    # Prepare optimizer
+    # Setup optimizer
     optimizer = torch.optim.AdamW(
         pipeline.unet.parameters(),
         lr=config.learning_rate
     )
     
-    # Prepare scheduler
+    # Get scheduler
+    num_update_steps_per_epoch = len(dataloader)
+    num_training_steps = config.num_train_epochs * num_update_steps_per_epoch
     lr_scheduler = get_scheduler(
         config.lr_scheduler,
         optimizer=optimizer,
         num_warmup_steps=config.lr_warmup_steps,
-        num_training_steps=len(dataloader) * config.num_train_epochs
+        num_training_steps=num_training_steps
     )
     
-    # Prepare for training
-    pipeline.train()
-    
-    # Accelerator prep
-    pipeline, optimizer, dataloader, lr_scheduler = accelerator.prepare(
-        pipeline, optimizer, dataloader, lr_scheduler
+    # Let accelerator handle device placement
+    pipeline.unet, optimizer, dataloader, lr_scheduler = accelerator.prepare(
+        pipeline.unet, optimizer, dataloader, lr_scheduler
     )
+    
+    # Move other components to device after accelerator prep
+    pipeline.vae = pipeline.vae.to(device=device, dtype=dtype)
+    pipeline.text_encoder = pipeline.text_encoder.to(device=device, dtype=dtype)
+    text_embeddings = pipeline.text_encoder(text_input.input_ids.to(device))[0].to(dtype=dtype)
     
     # Training loop
-    total_steps = len(dataloader) * config.num_train_epochs
-    progress_bar = tqdm(range(total_steps), desc="Training")
-    
+    progress_bar = tqdm(range(len(dataloader)))
     for epoch in range(config.num_train_epochs):
         for batch in dataloader:
-            with accelerator.accumulate(pipeline):
+            with accelerator.accumulate(pipeline.unet):
+                # Move batch to device
+                source_images = batch["source_images"].to(device=device, dtype=dtype)
+                
                 # Convert images to latent space
-                latents = pipeline.vae.encode(
-                    batch["source_images"].to(device)
-                ).latent_dist.sample() * 0.18215
+                with torch.no_grad():  # Don't track VAE gradients
+                    latents = pipeline.vae.encode(source_images).latent_dist.sample() * 0.18215
                 
                 # Add noise
-                noise = torch.randn_like(latents)
+                noise = torch.randn_like(latents, device=device)
                 timesteps = torch.randint(
                     0, pipeline.scheduler.config.num_train_timesteps,
-                    (latents.shape[0],), device=latents.device
+                    (latents.shape[0],), device=device
                 )
                 noisy_latents = pipeline.scheduler.add_noise(latents, noise, timesteps)
                 
                 # Predict the noise
-                noise_pred = pipeline.unet(noisy_latents, timesteps)["sample"]
+                noise_pred = pipeline.unet(
+                    noisy_latents,
+                    timesteps,
+                    encoder_hidden_states=text_embeddings
+                )["sample"]
                 
-                # Calculate loss
-                loss = F.mse_loss(noise_pred, noise)
-                accelerator.backward(loss)
+                # Calculate loss (ensure same device)
+                loss = F.mse_loss(noise_pred.float(), noise.float())
                 
-                # Update weights
+                # Backward pass with retain_graph
+                accelerator.backward(loss, retain_graph=True)
+                
+                # Optimizer step
                 optimizer.step()
                 lr_scheduler.step()
-                optimizer.zero_grad()
-            
-            # Update progress
-            progress_bar.update(1)
-            wandb.log({
-                "loss": loss.detach().item(),
-                "lr": lr_scheduler.get_last_lr()[0],
-                "epoch": epoch
-            })
-            
-        # Save checkpoint at each epoch
-        if epoch % 10 == 0:
-            pipeline.save_pretrained(
-                Config.MODELS_DIR / f"checkpoint-{epoch}",
-                safe_serialization=True
-            )
+                optimizer.zero_grad(set_to_none=True)  # More efficient cleanup
+                
+                progress_bar.update(1)
+                wandb.log({"loss": loss.item()})
     
     return pipeline
 
@@ -351,8 +354,8 @@ def main():
     
     # Force data collection first
     print("\nStarting artwork collection...")
-    monet_count, vangogh_count = collect_artwork()
-    print(f"\nCollected {monet_count} Monet paintings and {vangogh_count} Van Gogh paintings")
+    vangogh_count = collect_artwork()
+    print(f"\nCollected {vangogh_count} Van Gogh paintings")
     
     # Setup model and accelerator
     pipeline, accelerator = setup_model(training_config, device)
@@ -363,14 +366,14 @@ def main():
         print("GPU Memory cached:", torch.cuda.memory_reserved() / 1e9, "GB")
     
     # Check if we have data
-    if monet_count > 0 and vangogh_count > 0:
+    if vangogh_count > 0:
         print("\nStarting training loop...")
         pipeline = train_loop(training_config, pipeline, accelerator, device)
         print("\nTraining completed!")
         
         # Generate sample images
         print("\nGenerating sample images...")
-        test_images = list(Config.MONET_DIR.glob("*.jpg"))[:5]  # Use first 5 Monet paintings
+        test_images = list(Config.VANGOGH_DIR.glob("*.jpg"))[:5]  # Use first 5 Van Gogh paintings
         generated_images = generate_images(
             pipeline=pipeline,
             source_images=test_images,
