@@ -11,4 +11,5 @@ scipy>=1.10.0
 safetensors>=0.3.1
 bitsandbytes>=0.41.1  # For 8-bit optimization when using GPU
 peft>=0.6.0  # Required for LoRA implementation
+xformers>=0.0.20  # Adding back for GPU acceleration
 # Removed xformers as it's not compatible with MacOS 

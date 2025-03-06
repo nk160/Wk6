@@ -77,7 +77,7 @@ def setup_model(config: TrainingConfig, device: str):
 class ArtworkDataset(Dataset):
     """Simplified dataset for artwork images"""
     def __init__(self, source_dir: Path, resolution: int = 512):
-        self.source_images = list(source_dir.glob("*.jpg"))
+        self.source_images = list(source_dir.glob("**/*.jpg"))
         self.transform = transforms.Compose([
             transforms.Resize(resolution),
             transforms.ToTensor()
@@ -198,7 +198,7 @@ def main():
     
     # Generate one test image
     print("\nGenerating test image...")
-    test_image = list(Config.VANGOGH_DIR.glob("*.jpg"))[0]
+    test_image = list(Config.VANGOGH_DIR.glob("**/*.jpg"))[0]
     generated = generate_images(
         pipeline=pipeline,
         source_images=[test_image],

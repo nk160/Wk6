@@ -167,6 +167,54 @@ class VerboseMonitor:
         
         self.observer.join()
 
+def monitor_directory(directory_path: Path, file_type: str = None):
+    """
+    Monitor a directory for file changes and growth
+    
+    Args:
+        directory_path: Path to monitor
+        file_type: Optional file extension to monitor (e.g., 'json' or 'jpg')
+    """
+    print(f"\nMonitoring {directory_path}")
+    print("Press Ctrl+C to stop monitoring\n")
+    
+    previous_count = 0
+    previous_size = 0
+    start_time = time.time()
+    
+    while True:
+        try:
+            # Get all files or specific file types
+            if file_type:
+                files = list(directory_path.glob(f"*.{file_type}"))
+            else:
+                files = list(directory_path.rglob("*"))
+            
+            # Calculate current stats
+            current_count = len(files)
+            current_size = sum(f.stat().st_size for f in files if f.is_file())
+            current_size_mb = current_size / (1024 * 1024)  # Convert to MB
+            
+            # Calculate rates
+            elapsed_time = time.time() - start_time
+            files_per_second = current_count / elapsed_time if elapsed_time > 0 else 0
+            
+            # Clear previous line and print update
+            print(f"\r{datetime.now().strftime('%H:%M:%S')} - "
+                  f"Files: {current_count} "
+                  f"(+{current_count - previous_count}) | "
+                  f"Size: {current_size_mb:.2f}MB | "
+                  f"Rate: {files_per_second:.2f} files/s", end="")
+            
+            previous_count = current_count
+            previous_size = current_size
+            
+            time.sleep(1)  # Update every second
+            
+        except KeyboardInterrupt:
+            print("\nMonitoring stopped")
+            break
+
 if __name__ == "__main__":
     # Install required package if not present
     try:
@@ -176,4 +224,12 @@ if __name__ == "__main__":
         subprocess.run(["pip", "install", "watchdog"])
     
     monitor = VerboseMonitor()
-    monitor.monitor() 
+    monitor.monitor()
+
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--path", type=str, required=True, help="Directory to monitor")
+    parser.add_argument("--type", type=str, help="File type to monitor (e.g., json, jpg)")
+    args = parser.parse_args()
+    
+    monitor_directory(Path(args.path), args.type) 
