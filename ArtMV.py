@@ -33,22 +33,22 @@ class TrainingConfig:
     resolution: int = 512
     
     # Training parameters
-    train_batch_size: int = 8
-    num_train_epochs: int = 1
+    train_batch_size: int = 4
+    num_train_epochs: int = 3
     gradient_accumulation_steps: int = 1
     
     # Optimizer parameters
-    learning_rate: float = 1e-4
+    learning_rate: float = 5e-4
     lr_scheduler: str = "cosine"
-    lr_warmup_steps: int = 100
+    lr_warmup_steps: int = 500  # Longer warmup
     
     # Performance parameters
     mixed_precision: str = "fp16"
     seed: int = 42
     
     # LoRA specific parameters
-    lora_r: int = 16
-    lora_alpha: int = 32
+    lora_r: int = 64
+    lora_alpha: int = 128
     lora_dropout: float = 0.1
 
 def setup_model(config: TrainingConfig, device: str):
@@ -64,9 +64,15 @@ def setup_model(config: TrainingConfig, device: str):
     
     # Minimal LoRA config
     lora_config = LoraConfig(
-        r=16,
-        lora_alpha=32,
-        target_modules=["conv", "to_q", "to_k", "to_v", "to_out.0"],  # Only supported modules
+        r=64,
+        lora_alpha=128,
+        target_modules=[
+            "conv",
+            "to_q",
+            "to_k", 
+            "to_v",
+            "to_out.0"
+        ],
         lora_dropout=0.1,
         bias="none"
     )
@@ -80,6 +86,7 @@ class ArtworkDataset(Dataset):
         self.source_images = list(source_dir.glob("**/*.jpg"))
         self.transform = transforms.Compose([
             transforms.Resize(resolution),
+            transforms.CenterCrop(resolution),
             transforms.ToTensor()
         ])
         
@@ -93,16 +100,23 @@ class ArtworkDataset(Dataset):
 
 def train_loop(config: TrainingConfig, pipeline: StableDiffusionPipeline, device: str):
     """Simplified training loop"""
+    batch_size = 4  # Define batch size
     pipeline.unet.train()
     optimizer = torch.optim.AdamW(pipeline.unet.parameters(), lr=config.learning_rate)
     
     # Basic dataset and dataloader
     dataset = ArtworkDataset(Config.MONET_DIR, config.resolution)
-    dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
+    dataloader = DataLoader(dataset, 
+        batch_size=4,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+        drop_last=True  # Drop incomplete final batch
+    )
     
     # Get style prompt embeddings instead of empty
     text_input = pipeline.tokenizer(
-        ["A painting in the style of Van Gogh"] * 1,  # Style prompt
+        ["A vibrant post-impressionist painting with bold brushstrokes and swirling patterns in the style of Van Gogh"] * config.train_batch_size,
         return_tensors="pt",
         padding="max_length",
         max_length=pipeline.tokenizer.model_max_length
@@ -121,7 +135,7 @@ def train_loop(config: TrainingConfig, pipeline: StableDiffusionPipeline, device
             
             # Add noise
             noise = torch.randn_like(latents)
-            timesteps = torch.randint(0, 1000, (1,), device=device)
+            timesteps = torch.randint(0, 1000, (batch_size,), device=device)  # Match batch size
             noisy_latents = latents + noise
             
             # Get prediction
@@ -165,10 +179,10 @@ def generate_images(
         # Generate one image
         with torch.no_grad():
             output = pipeline(
-                prompt="A painting in the style of Van Gogh",  # Match training prompt
+                prompt="A vibrant post-impressionist painting with bold brushstrokes and swirling patterns in the style of Van Gogh",
                 image=tensor,
                 num_inference_steps=50,
-                guidance_scale=7.5
+                guidance_scale=12.0
             ).images[0]
             
             # Save and log
