@@ -2,3 +2,7 @@
 wandb/
 venv/
 data/
+wikiart/
+output/
+data/
+wandb/
