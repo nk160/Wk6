@@ -11,6 +11,7 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from peft import LoraConfig, get_peft_model
 from typing import List
+from transformers import CLIPVisionModel, CLIPImageProcessor
 
 # Project configuration
 class Config:
@@ -34,7 +35,7 @@ class TrainingConfig:
     
     # Training parameters
     train_batch_size: int = 4
-    num_train_epochs: int = 7
+    num_train_epochs: int = 1  # Test run
     gradient_accumulation_steps: int = 1
     
     # Optimizer parameters
@@ -54,6 +55,11 @@ class TrainingConfig:
 def setup_model(config: TrainingConfig, device: str):
     print("Loading Stable Diffusion model...")
     
+    # Load CLIP vision model
+    print("Loading CLIP vision model...")
+    image_encoder = CLIPVisionModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
+    image_processor = CLIPImageProcessor.from_pretrained("openai/clip-vit-base-patch32")
+    
     # Simple model loading without accelerator
     pipeline = StableDiffusionPipeline.from_pretrained(
         config.pretrained_model_name_or_path,
@@ -61,6 +67,10 @@ def setup_model(config: TrainingConfig, device: str):
         safety_checker=None,
         use_safetensors=True
     ).to(device)
+    
+    # Add image encoder to pipeline
+    pipeline.image_encoder = image_encoder
+    pipeline.image_processor = image_processor
     
     # Minimal LoRA config
     lora_config = LoraConfig(
@@ -116,15 +126,50 @@ def train_loop(config: TrainingConfig, pipeline: StableDiffusionPipeline, device
         drop_last=True  # Drop incomplete final batch
     )
     
-    # Get style prompt embeddings instead of empty
-    text_input = pipeline.tokenizer(
-        ["A vibrant post-impressionist painting with bold brushstrokes and swirling patterns in the style of Van Gogh"] * config.train_batch_size,
+    # Load both style reference images
+    monet_refs = list(Config.MONET_DIR.glob("**/*.jpg"))[:5]
+    vangogh_refs = list(Config.VANGOGH_DIR.glob("**/*.jpg"))[:5]
+    
+    # Load metadata
+    monet_meta = {
+        "artist": "Monet",
+        "style": "Impressionist",
+        "period": "19th century"
+    }
+    
+    vangogh_meta = {
+        "artist": "Van Gogh",
+        "style": "Post-Impressionist",
+        "period": "19th century"
+    }
+    
+    # Combine metadata into embeddings
+    meta_prompt = f"{monet_meta['style']} and {vangogh_meta['style']} painting"
+    meta_input = pipeline.tokenizer(
+        [meta_prompt],
         return_tensors="pt",
         padding="max_length",
         max_length=pipeline.tokenizer.model_max_length
     ).input_ids.to(device)
     
-    encoder_hidden_states = pipeline.text_encoder(text_input)[0]
+    meta_embeds = pipeline.text_encoder(meta_input)[0]
+    
+    # Get CLIP embeddings for style images
+    with torch.no_grad():
+        monet_embeds = get_image_embeddings(pipeline, monet_refs, device)
+        vangogh_embeds = get_image_embeddings(pipeline, vangogh_refs, device)
+        
+        # Combine style embeddings
+        style_embeds = torch.cat([monet_embeds, vangogh_embeds], dim=0)
+        style_embeds = style_embeds.mean(dim=0, keepdim=True)  # Average embedding
+        
+        # Project CLIP embeddings to text encoder dimension
+        projection = torch.nn.Linear(style_embeds.shape[-1], pipeline.text_encoder.config.hidden_size).to(device)
+        style_embeds = projection(style_embeds)
+        
+        # Expand to sequence length and batch size
+        style_embeds = style_embeds.unsqueeze(1).expand(-1, 77, -1)  # Add sequence dimension
+        style_embeds = style_embeds.expand(batch_size, -1, -1)  # Expand to batch size
     
     progress_bar = tqdm(dataloader)
     for epoch in range(config.num_train_epochs):
@@ -146,7 +191,7 @@ def train_loop(config: TrainingConfig, pipeline: StableDiffusionPipeline, device
                 pred = pipeline.unet(
                     noisy_latents,
                     timesteps,
-                    encoder_hidden_states=encoder_hidden_states
+                    encoder_hidden_states=style_embeds
                 ).sample
                 
                 loss = F.mse_loss(pred, latents)
@@ -169,6 +214,10 @@ def generate_images(
     pipeline.to(device)
     pipeline.unet.eval()
     
+    # Store original processor and temporarily replace
+    original_processor = pipeline.image_processor
+    pipeline.image_processor = None
+    
     transform = transforms.Compose([
         transforms.Resize(512),
         transforms.ToTensor()
@@ -187,7 +236,7 @@ def generate_images(
                 image=tensor,
                 num_inference_steps=50,
                 guidance_scale=12.0,
-                noise_scale=0.5  # Control denoising process
+                noise_scale=0.5
             ).images[0]
             
             # Save and log
@@ -196,7 +245,22 @@ def generate_images(
             generated_images.append(output)
             wandb.log({"output": wandb.Image(output)})
     
+    # Restore original processor
+    pipeline.image_processor = original_processor
     return generated_images
+
+def get_image_embeddings(pipeline, image_paths, device):
+    """Get CLIP embeddings for a list of images"""
+    embeddings = []
+    for path in image_paths:
+        image = Image.open(path).convert('RGB')
+        inputs = pipeline.image_processor(images=image, return_tensors="pt").to(device)
+        
+        # Get CLIP image embeddings
+        image_embeds = pipeline.image_encoder(**inputs).last_hidden_state.mean(dim=1)
+        embeddings.append(image_embeds)
+    
+    return torch.cat(embeddings, dim=0)
 
 def main():
     """Simplified main execution"""
