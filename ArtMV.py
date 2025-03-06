@@ -34,7 +34,7 @@ class TrainingConfig:
     
     # Training parameters
     train_batch_size: int = 4
-    num_train_epochs: int = 3
+    num_train_epochs: int = 7
     gradient_accumulation_steps: int = 1
     
     # Optimizer parameters
@@ -82,8 +82,10 @@ def setup_model(config: TrainingConfig, device: str):
 
 class ArtworkDataset(Dataset):
     """Simplified dataset for artwork images"""
-    def __init__(self, source_dir: Path, resolution: int = 512):
-        self.source_images = list(source_dir.glob("**/*.jpg"))
+    def __init__(self, source_dir: List[Path], resolution: int = 512):
+        self.source_images = []
+        for dir in source_dir:
+            self.source_images.extend(list(dir.glob("**/*.jpg")))
         self.transform = transforms.Compose([
             transforms.Resize(resolution),
             transforms.CenterCrop(resolution),
@@ -105,7 +107,7 @@ def train_loop(config: TrainingConfig, pipeline: StableDiffusionPipeline, device
     optimizer = torch.optim.AdamW(pipeline.unet.parameters(), lr=config.learning_rate)
     
     # Basic dataset and dataloader
-    dataset = ArtworkDataset(Config.MONET_DIR, config.resolution)
+    dataset = ArtworkDataset([Config.MONET_DIR, Config.VANGOGH_DIR], config.resolution)
     dataloader = DataLoader(dataset, 
         batch_size=4,
         shuffle=True,
@@ -125,34 +127,36 @@ def train_loop(config: TrainingConfig, pipeline: StableDiffusionPipeline, device
     encoder_hidden_states = pipeline.text_encoder(text_input)[0]
     
     progress_bar = tqdm(dataloader)
-    for batch in progress_bar:
-        images = batch.to(device)
-        
-        # Forward pass
-        with torch.autocast(device_type=device):
-            # Convert images to latent space
-            latents = pipeline.vae.encode(images).latent_dist.sample() * 0.18215
+    for epoch in range(config.num_train_epochs):
+        print(f"\nEpoch {epoch+1}/{config.num_train_epochs}")
+        for batch in progress_bar:
+            images = batch.to(device)
             
-            # Add noise
-            noise = torch.randn_like(latents)
-            timesteps = torch.randint(0, 1000, (batch_size,), device=device)  # Match batch size
-            noisy_latents = latents + noise
+            # Forward pass
+            with torch.autocast(device_type=device):
+                # Convert images to latent space
+                latents = pipeline.vae.encode(images).latent_dist.sample() * 0.18215
+                
+                # Add noise
+                noise = torch.randn_like(latents)
+                timesteps = torch.randint(0, 1000, (batch_size,), device=device)  # Match batch size
+                noisy_latents = latents + noise
+                
+                # Get prediction
+                pred = pipeline.unet(
+                    noisy_latents,
+                    timesteps,
+                    encoder_hidden_states=encoder_hidden_states
+                ).sample
+                
+                loss = F.mse_loss(pred, latents)
             
-            # Get prediction
-            pred = pipeline.unet(
-                noisy_latents,
-                timesteps,
-                encoder_hidden_states=encoder_hidden_states
-            ).sample
+            optimizer.zero_grad()
+            loss.backward(retain_graph=True)
+            optimizer.step()
             
-            loss = F.mse_loss(pred, latents)
-        
-        optimizer.zero_grad()
-        loss.backward(retain_graph=True)
-        optimizer.step()
-        
-        progress_bar.set_description(f"Loss: {loss.item():.4f}")
-        wandb.log({"loss": loss.item()})
+            progress_bar.set_description(f"Loss: {loss.item():.4f}")
+            wandb.log({"loss": loss.item()})
     
     return pipeline
 
@@ -182,7 +186,8 @@ def generate_images(
                 prompt="A vibrant post-impressionist painting with bold brushstrokes and swirling patterns in the style of Van Gogh",
                 image=tensor,
                 num_inference_steps=50,
-                guidance_scale=12.0
+                guidance_scale=12.0,
+                noise_scale=0.5  # Control denoising process
             ).images[0]
             
             # Save and log
