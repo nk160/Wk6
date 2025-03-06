@@ -34,7 +34,7 @@ class TrainingConfig:
     
     # Training parameters
     train_batch_size: int = 8
-    num_train_epochs: int = 1  # Changed from 10 to 1 for testing
+    num_train_epochs: int = 1
     gradient_accumulation_steps: int = 1
     
     # Optimizer parameters
@@ -66,7 +66,7 @@ def setup_model(config: TrainingConfig, device: str):
     lora_config = LoraConfig(
         r=16,
         lora_alpha=32,
-        target_modules=["conv_in"],
+        target_modules=["conv", "to_q", "to_k", "to_v", "to_out.0"],  # Only supported modules
         lora_dropout=0.1,
         bias="none"
     )
@@ -165,7 +165,7 @@ def generate_images(
         # Generate one image
         with torch.no_grad():
             output = pipeline(
-                prompt="",  # Empty prompt for style transfer
+                prompt="A painting in the style of Van Gogh",  # Match training prompt
                 image=tensor,
                 num_inference_steps=50,
                 guidance_scale=7.5
