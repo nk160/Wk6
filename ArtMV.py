@@ -35,13 +35,14 @@ class TrainingConfig:
     
     # Training parameters
     train_batch_size: int = 4
-    num_train_epochs: int = 1  # Test run
+    num_train_epochs: int = 1
+    max_train_steps: int = 450  # New: limit total training steps
     gradient_accumulation_steps: int = 1
     
     # Optimizer parameters
-    learning_rate: float = 5e-4
-    lr_scheduler: str = "cosine"
-    lr_warmup_steps: int = 500  # Longer warmup
+    learning_rate: float = 1e-4
+    lr_scheduler: str = "linear"
+    lr_warmup_steps: int = 100  # Reduced from 700 since we have fewer steps
     
     # Performance parameters
     mixed_precision: str = "fp16"
@@ -95,7 +96,8 @@ class ArtworkDataset(Dataset):
     def __init__(self, source_dir: List[Path], resolution: int = 512):
         self.source_images = []
         for dir in source_dir:
-            self.source_images.extend(list(dir.glob("**/*.jpg")))
+            self.source_images.extend(list(dir.glob("**/*.jpg")))  # Get jpg files
+            self.source_images.extend(list(dir.glob("**/*.png")))  # Get png files
         self.transform = transforms.Compose([
             transforms.Resize(resolution),
             transforms.CenterCrop(resolution),
@@ -127,8 +129,11 @@ def train_loop(config: TrainingConfig, pipeline: StableDiffusionPipeline, device
     )
     
     # Load both style reference images
-    monet_refs = list(Config.MONET_DIR.glob("**/*.jpg"))[:5]
-    vangogh_refs = list(Config.VANGOGH_DIR.glob("**/*.jpg"))[:5]
+    monet_refs = []
+    monet_refs.extend(list(Config.MONET_DIR.glob("**/*.jpg"))[:5])
+    
+    vangogh_refs = []
+    vangogh_refs.extend(list(Config.VANGOGH_DIR.glob("**/*.png"))[:5])
     
     # Load metadata
     monet_meta = {
@@ -172,9 +177,17 @@ def train_loop(config: TrainingConfig, pipeline: StableDiffusionPipeline, device
         style_embeds = style_embeds.expand(batch_size, -1, -1)  # Expand to batch size
     
     progress_bar = tqdm(dataloader)
+    best_loss = float('inf')
+    patience = 50  # Steps to wait before early stopping
+    steps_without_improvement = 0
+    
     for epoch in range(config.num_train_epochs):
         print(f"\nEpoch {epoch+1}/{config.num_train_epochs}")
-        for batch in progress_bar:
+        for step, batch in enumerate(progress_bar):
+            if step >= config.max_train_steps:
+                print(f"\nReached max steps ({config.max_train_steps})")
+                break
+            
             images = batch.to(device)
             
             # Forward pass
@@ -202,6 +215,22 @@ def train_loop(config: TrainingConfig, pipeline: StableDiffusionPipeline, device
             
             progress_bar.set_description(f"Loss: {loss.item():.4f}")
             wandb.log({"loss": loss.item()})
+            
+            # Early stopping check
+            if loss.item() < best_loss:
+                best_loss = loss.item()
+                steps_without_improvement = 0
+            else:
+                steps_without_improvement += 1
+            
+            if steps_without_improvement >= patience:
+                print(f"\nEarly stopping at step {step}")
+                break
+    
+    print("Saving model...")
+    save_path = Config.MODELS_DIR / "monet_vangogh_style"
+    pipeline = save_lora_model(pipeline, save_path)
+    print(f"Model saved to {save_path}")
     
     return pipeline
 
@@ -214,39 +243,46 @@ def generate_images(
     pipeline.to(device)
     pipeline.unet.eval()
     
-    # Store original processor and temporarily replace
-    original_processor = pipeline.image_processor
-    pipeline.image_processor = None
+    # Get the base unet from the LoRA model
+    base_unet = pipeline.unet.get_base_model()
+    
+    # Switch to img2img pipeline for generation
+    from diffusers import StableDiffusionImg2ImgPipeline
+    img2img = StableDiffusionImg2ImgPipeline.from_pretrained(
+        "runwayml/stable-diffusion-v1-5",
+        unet=base_unet,  # Use the base unet, not the LoRA wrapper
+        torch_dtype=torch.float16,
+        safety_checker=None,
+        use_safetensors=True
+    ).to(device)
     
     transform = transforms.Compose([
         transforms.Resize(512),
-        transforms.ToTensor()
+        transforms.CenterCrop(512),
+        transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
     ])
     
     generated_images = []
     for source_path in source_images:
-        # Load and transform image
         image = Image.open(source_path).convert('RGB')
-        tensor = transform(image).unsqueeze(0).to(device)
+        image = transform(image).unsqueeze(0).to(device)
         
-        # Generate one image
         with torch.no_grad():
-            output = pipeline(
-                prompt="A vibrant post-impressionist painting with bold brushstrokes and swirling patterns in the style of Van Gogh",
-                image=tensor,
-                num_inference_steps=50,
-                guidance_scale=12.0,
-                noise_scale=0.5
+            output = img2img(
+                prompt="A Van Gogh masterpiece of tulips with extremely pronounced, thick impasto brushstrokes. Each petal and stem defined by single, decisive strokes. Heavy paint application with clear, bold outlines. Rich blues and reds against golden background, each brushstroke standing out in relief",
+                image=image,
+                strength=0.45,  # Increased from 0.40
+                guidance_scale=9.5,  # Up from 8.5 for more definition
+                num_inference_steps=200,  # Reduced for bolder strokes
+                negative_prompt="subtle, blended, smooth, soft, detailed, intricate, small strokes, pointillism, dots, fragmented, busy, noisy"
             ).images[0]
             
-            # Save and log
             output_path = Config.OUTPUT_DIR / f"{source_path.stem}_output.png"
             output.save(output_path)
             generated_images.append(output)
             wandb.log({"output": wandb.Image(output)})
     
-    # Restore original processor
-    pipeline.image_processor = original_processor
     return generated_images
 
 def get_image_embeddings(pipeline, image_paths, device):
@@ -261,6 +297,11 @@ def get_image_embeddings(pipeline, image_paths, device):
         embeddings.append(image_embeds)
     
     return torch.cat(embeddings, dim=0)
+
+def save_lora_model(pipeline, save_path):
+    """Save LoRA weights properly"""
+    pipeline.unet.save_pretrained(save_path)
+    return pipeline
 
 def main():
     """Simplified main execution"""
@@ -281,10 +322,11 @@ def main():
     
     # Generate one test image
     print("\nGenerating test image...")
-    test_image = list(Config.VANGOGH_DIR.glob("**/*.jpg"))[0]
+    test_images = []
+    test_images.extend(list(Config.VANGOGH_DIR.glob("**/*.png"))[:1])  # Get first png file
     generated = generate_images(
         pipeline=pipeline,
-        source_images=[test_image],
+        source_images=test_images,
         device=device
     )
     print("Done!")
